@@ -1,0 +1,7 @@
+slack_sdk==3.*
+notion-client==2.*
+beautifulsoup4==4.*
+requests==2.*
+dotenv==0.*
+tzdata==2024.1
+
