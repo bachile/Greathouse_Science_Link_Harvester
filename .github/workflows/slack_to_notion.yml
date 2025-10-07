@@ -2,8 +2,8 @@ name: Slack → Notion (links)
 
 on:
   # Run every 30 minutes (UTC). Adjust as you like.
-  schedule:
-    - cron: "*/30 * * * *"
+  #schedule:
+  #  - cron: "*/30 * * * *"
   # Allow manual runs from the Actions tab
   workflow_dispatch: {}
 
