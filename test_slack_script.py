@@ -1,8 +1,12 @@
-# Python 3.9-compatible – Slack → Notion link harvester with URL canonicalization
+# Python 3.9-compatible – Slack → Notion link harvester
+# - Canonicalizes URLs to avoid duplicates
+# - Fetches human-friendly titles (OG/Twitter meta, <title>, <h1>, PDF filenames, or URL inference)
+# - Stores into Notion with properties: Article Name (Title), URL or Permalink (URL), Shared by (Rich text), Shared on (Date)
+
 import os, re, time, html
 from typing import Iterable, List, Dict, Any, Optional, Union
 from datetime import datetime, timezone
-from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode, unquote, parse_qs
 
 try:
     from zoneinfo import ZoneInfo
@@ -18,24 +22,29 @@ from slack_sdk.errors import SlackApiError
 from notion_client import Client as Notion
 from notion_client.errors import APIResponseError
 
-# ---------- config ----------
+# ------------- Config -------------
 load_dotenv()
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 SLACK_CHANNEL_ID = os.getenv("SLACK_CHANNEL_ID")
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
-for k,v in {"SLACK_BOT_TOKEN":SLACK_BOT_TOKEN,"SLACK_CHANNEL_ID":SLACK_CHANNEL_ID,
-            "NOTION_TOKEN":NOTION_TOKEN,"NOTION_DATABASE_ID":NOTION_DATABASE_ID}.items():
+
+for k, v in {
+    "SLACK_BOT_TOKEN": SLACK_BOT_TOKEN,
+    "SLACK_CHANNEL_ID": SLACK_CHANNEL_ID,
+    "NOTION_TOKEN": NOTION_TOKEN,
+    "NOTION_DATABASE_ID": NOTION_DATABASE_ID,
+}.items():
     if not v:
-        raise RuntimeError(f"Missing {k}")
+        raise RuntimeError(f"Missing {k} in environment/.env")
 
 slack = WebClient(token=SLACK_BOT_TOKEN)
 notion = Notion(auth=NOTION_TOKEN)
 
-# Be stricter: stop at spaces and angle brackets
+# Strict-ish URL capture (stop at spaces/angle-brackets)
 URL_RE = re.compile(r"https?://[^\s<>]+")
 
-# Common tracking params to drop for canonicalization
+# Common tracking params to strip for canonicalization
 TRACKING_KEYS = {
     "utm_source","utm_medium","utm_campaign","utm_term","utm_content",
     "utm_name","utm_cid","utm_reader","utm_viz_id","utm_pubreferrer",
@@ -43,42 +52,75 @@ TRACKING_KEYS = {
     "fbclid","gclid","mc_cid","mc_eid","igshid","mkt_tok"
 }
 
-# ---------- helpers ----------
-def chicago_time_from_ts(ts:Union[str,float])->str:
-    try: ts=float(ts)
-    except: ts=time.time()
-    return datetime.fromtimestamp(ts,tz=CENTRAL).strftime("%Y-%m-%d %H:%M:%S %Z")
+# ------------- Time helpers -------------
+def chicago_time_from_ts(ts: Union[str, float]) -> str:
+    try:
+        tsf = float(ts)
+    except Exception:
+        tsf = time.time()
+    return datetime.fromtimestamp(tsf, tz=CENTRAL).strftime("%Y-%m-%d %H:%M:%S %Z")
 
-def iso_from_ts(ts:Union[str,float])->str:
-    try: ts=float(ts)
-    except: ts=time.time()
-    return datetime.fromtimestamp(ts,tz=timezone.utc).isoformat()
+def iso_from_ts(ts: Union[str, float]) -> str:
+    try:
+        tsf = float(ts)
+    except Exception:
+        tsf = time.time()
+    return datetime.fromtimestamp(tsf, tz=timezone.utc).isoformat()
 
-def get_user_display(uid:Optional[str])->str:
-    if not uid: return "Unknown"
-    if uid.startswith(("U","W")):
+# ------------- Slack helpers -------------
+def get_user_display(uid: Optional[str]) -> str:
+    if not uid:
+        return "Unknown"
+    if uid.startswith(("U", "W")):
         try:
-            u=slack.users_info(user=uid)["user"]
-            p=u.get("profile",{})
+            u = slack.users_info(user=uid)["user"]
+            p = u.get("profile", {})
             return p.get("display_name") or u.get("real_name") or uid
-        except SlackApiError: return uid
+        except SlackApiError:
+            return uid
     return "Bot"
 
+def list_all_messages(cid: str) -> Iterable[Dict[str, Any]]:
+    """Yield all messages (chronological) including thread replies."""
+    cursor = None
+    messages: List[Dict[str, Any]] = []
+    while True:
+        r = slack.conversations_history(channel=cid, cursor=cursor, limit=200)
+        messages += r.get("messages", [])
+        cursor = r.get("response_metadata", {}).get("next_cursor")
+        if not cursor:
+            break
+        time.sleep(0.25)
+
+    for m in reversed(messages):
+        yield m
+        if m.get("thread_ts") and int(m.get("reply_count", 0)) > 0:
+            tcur = None
+            tmsgs: List[Dict[str, Any]] = []
+            while True:
+                rr = slack.conversations_replies(channel=cid, ts=m["thread_ts"], cursor=tcur, limit=200)
+                tmsgs += rr.get("messages", [])[1:]  # skip parent
+                tcur = rr.get("response_metadata", {}).get("next_cursor")
+                if not tcur:
+                    break
+                time.sleep(0.2)
+            for t in tmsgs:
+                yield t
+
+# ------------- URL normalization -------------
 def canonicalize_url(u: str) -> Optional[str]:
     if not u:
         return None
-    # Unescape HTML entities and trim common wrappers
     u = html.unescape(u).strip()
-    # Slack formats: <url|label> or <url>
+    # Slack <url|label> or <url>
     if u.startswith("<") and ">" in u:
         inner = u[1:u.index(">")]
         if "|" in inner:
             inner = inner.split("|", 1)[0]
         u = inner
-    # If someone pasted two links separated by |, take the first valid URL
+    # If someone typed two links separated by |, take the first
     if "|" in u:
         u = u.split("|", 1)[0].strip()
-    # Trim dangling punctuation from copy/paste
     u = u.rstrip(").,]}>\"'")
 
     try:
@@ -90,18 +132,15 @@ def canonicalize_url(u: str) -> Optional[str]:
 
     scheme = p.scheme.lower()
     netloc = p.netloc.lower()
-    # Drop default ports
     if netloc.endswith(":80") and scheme == "http":
         netloc = netloc[:-3]
     if netloc.endswith(":443") and scheme == "https":
         netloc = netloc[:-4]
 
-    # Normalize path: remove trailing slash (except root)
     path = p.path or ""
     if path.endswith("/") and len(path) > 1:
         path = path.rstrip("/")
 
-    # Clean/sort query params, remove tracking keys
     q_pairs = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)]
     q_pairs = [(k, v) for (k, v) in q_pairs if k not in TRACKING_KEYS]
     if q_pairs:
@@ -110,47 +149,22 @@ def canonicalize_url(u: str) -> Optional[str]:
     else:
         query = ""
 
-    # Drop fragments
     fragment = ""
-
     return urlunparse((scheme, netloc, path, "", query, fragment))
 
-def list_all_messages(cid:str)->Iterable[Dict[str,Any]]:
-    cur=None; msgs=[]
-    while True:
-        r=slack.conversations_history(channel=cid,cursor=cur,limit=200)
-        msgs+=r.get("messages",[])
-        cur=r.get("response_metadata",{}).get("next_cursor")
-        if not cur: break
-        time.sleep(0.25)
-    for m in reversed(msgs):
-        yield m
-        if m.get("thread_ts") and int(m.get("reply_count",0))>0:
-            tcur=None; tmsgs=[]
-            while True:
-                rr=slack.conversations_replies(channel=cid,ts=m["thread_ts"],cursor=tcur,limit=200)
-                tmsgs+=rr.get("messages",[])[1:]
-                tcur=rr.get("response_metadata",{}).get("next_cursor")
-                if not tcur: break
-                time.sleep(0.2)
-            for t in tmsgs: yield t
-
-def extract_urls(msg:Dict[str,Any])->List[str]:
+def extract_urls(msg: Dict[str, Any]) -> List[str]:
     candidates: List[str] = []
-
-    text=msg.get("text") or ""
+    text = msg.get("text") or ""
     candidates += URL_RE.findall(text)
 
-    # attachments
     for a in msg.get("attachments", []) or []:
         if not isinstance(a, dict):
             continue
-        for k in ("original_url","title_link","from_url"):
+        for k in ("original_url", "title_link", "from_url"):
             v = a.get(k)
             if isinstance(v, str):
                 candidates.append(v)
 
-    # blocks (nested)
     def walk(o: Any):
         if isinstance(o, dict):
             v = o.get("url")
@@ -165,8 +179,8 @@ def extract_urls(msg:Dict[str,Any])->List[str]:
     for b in msg.get("blocks", []) or []:
         walk(b)
 
-    # Normalize + de-dupe
-    seen=set(); out=[]
+    seen = set()
+    out: List[str] = []
     for raw in candidates:
         canon = canonicalize_url(raw)
         if canon and canon not in seen:
@@ -174,99 +188,209 @@ def extract_urls(msg:Dict[str,Any])->List[str]:
             out.append(canon)
     return out
 
-def is_pdf_like(f:Dict[str,Any])->bool:
-    if not f: return False
-    mt=(f.get("mimetype") or "").lower()
-    ft=(f.get("filetype") or "").lower()
-    n=(f.get("name") or f.get("title") or "").lower()
-    return mt=="application/pdf" or ft=="pdf" or n.endswith(".pdf")
+def is_pdf_like(f: Dict[str, Any]) -> bool:
+    if not f:
+        return False
+    mt = (f.get("mimetype") or "").lower()
+    ft = (f.get("filetype") or "").lower()
+    n = (f.get("name") or f.get("title") or "").lower()
+    return mt == "application/pdf" or ft == "pdf" or n.endswith(".pdf")
 
-def message_permalink(cid:str,ts:str)->Optional[str]:
+def message_permalink(cid: str, ts: str) -> Optional[str]:
     try:
-        return slack.chat_getPermalink(channel=cid,message_ts=ts).get("permalink")
+        return slack.chat_getPermalink(channel=cid, message_ts=ts).get("permalink")
     except SlackApiError:
         return None
 
-def first_pdf_name(msg:Dict[str,Any])->Optional[str]:
+def first_pdf_name(msg: Dict[str, Any]) -> Optional[str]:
     for f in msg.get("files") or []:
-        if isinstance(f,dict) and is_pdf_like(f):
+        if isinstance(f, dict) and is_pdf_like(f):
             return f.get("name") or f.get("title")
     return None
 
-def pdf_message_links(msg:Dict[str,Any],cid:str)->List[str]:
-    fs=msg.get("files") or []
-    if not isinstance(fs,list) or not fs: return []
-    if not any(is_pdf_like(f) for f in fs if isinstance(f,dict)): return []
-    ts=msg.get("ts"); 
-    if not ts: return []
-    link=message_permalink(cid,ts)
-    if not link: return []
+def pdf_message_links(msg: Dict[str, Any], cid: str) -> List[str]:
+    fs = msg.get("files") or []
+    if not isinstance(fs, list) or not fs:
+        return []
+    if not any(is_pdf_like(f) for f in fs if isinstance(f, dict)):
+        return []
+    ts = msg.get("ts")
+    if not ts:
+        return []
+    link = message_permalink(cid, ts)
+    if not link:
+        return []
     canon = canonicalize_url(link) or link
     return [canon]
 
-def fetch_title(url:str,timeout:int=8)->Optional[str]:
+# ------------- Title resolution -------------
+def _clean_title(txt: Optional[str]) -> Optional[str]:
+    if not txt:
+        return None
+    t = " ".join(txt.strip().split())
+    return t[:300] if t else None
+
+def _infer_title_from_url(url: str) -> Optional[str]:
     try:
-        r=requests.get(url,timeout=timeout,headers={"User-Agent":"Mozilla/5.0"})
-        r.raise_for_status()
-        s=BeautifulSoup(r.text,"html.parser")
-        og=s.find("meta",property="og:title")
-        if og and og.get("content"): return og["content"].strip()
-        if s.title and s.title.string: return s.title.string.strip()
-    except Exception: pass
+        p = urlparse(url)
+        q = parse_qs(p.query)
+        for key in ("title", "headline", "paper", "article", "name"):
+            if key in q and q[key]:
+                guess = _clean_title(unquote(q[key][0]))
+                if guess:
+                    return guess
+
+        parts = [seg for seg in p.path.split("/") if seg]
+        if parts:
+            leaf = parts[-1]
+            if "." in leaf:
+                leaf = leaf.rsplit(".", 1)[0]
+            leaf = unquote(leaf)
+            leaf = leaf.replace("-", " ").replace("_", " ")
+            guess = _clean_title(leaf.title())
+            if guess and len(guess) >= 4:
+                return guess
+
+        host = (p.netloc or "").split(":")[0]
+        if host:
+            return host
+    except Exception:
+        pass
     return None
 
-# ---------- Notion ----------
-def notion_find_by_url(db:str,url:str)->Optional[str]:
+def _is_pdf_response(resp: requests.Response) -> bool:
+    ctype = resp.headers.get("Content-Type", "").lower()
+    return "application/pdf" in ctype or resp.url.lower().endswith(".pdf")
+
+def _filename_from_headers(resp: requests.Response) -> Optional[str]:
+    cd = resp.headers.get("Content-Disposition", "")
+    if "filename=" in cd:
+        fname = cd.split("filename=", 1)[1].strip().strip("\"'")
+        return _clean_title(fname)
+    return None
+
+def fetch_title(url: str, timeout: int = 8) -> Optional[str]:
+    """
+    Resolve a human-friendly title:
+    1) OG/Twitter meta, <title>, <h1>
+    2) If PDF: Content-Disposition filename or last path segment
+    3) Otherwise, infer from URL (path/query) as a last resort
+    """
     try:
-        r=notion.databases.query(database_id=db,
-            filter={"property":"URL or Permalink","url":{"equals":url}},page_size=1)
-        res=r.get("results",[])
+        r = requests.get(
+            url,
+            timeout=timeout,
+            headers={"User-Agent": "Mozilla/5.0 (LinkHarvester/1.0)"},
+            allow_redirects=True,
+        )
+        r.raise_for_status()
+
+        if _is_pdf_response(r):
+            name = _filename_from_headers(r)
+            if not name:
+                p = urlparse(r.url)
+                segs = [s for s in p.path.split("/") if s]
+                if segs:
+                    name = _clean_title(unquote(segs[-1]))
+            if name and name.lower().endswith(".pdf"):
+                name = name[:-4]
+            return name or "PDF"
+
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        # Preferred: Open Graph / Twitter
+        for css, attr in [
+            ('meta[property="og:title"]', "content"),
+            ('meta[name="og:title"]', "content"),
+            ('meta[name="twitter:title"]', "content"),
+            ('meta[property="twitter:title"]', "content"),
+        ]:
+            el = soup.select_one(css)
+            if el and el.get(attr):
+                cand = _clean_title(el.get(attr))
+                if cand:
+                    return cand
+
+        # <title>
+        if soup.title and soup.title.string:
+            cand = _clean_title(soup.title.string)
+            if cand:
+                return cand
+
+        # First <h1>
+        h1 = soup.find("h1")
+        if h1:
+            cand = _clean_title(h1.get_text(" "))
+            if cand:
+                return cand
+
+    except Exception:
+        pass
+
+    return _infer_title_from_url(url)
+
+# ------------- Notion (upsert by URL) -------------
+def notion_find_by_url(db: str, url: str) -> Optional[str]:
+    try:
+        r = notion.databases.query(
+            database_id=db,
+            filter={"property": "URL or Permalink", "url": {"equals": url}},
+            page_size=1,
+        )
+        res = r.get("results", [])
         return res[0]["id"] if res else None
     except APIResponseError as e:
-        print("[Notion] Query failed:",getattr(e,"message",str(e))); return None
+        print("[Notion] Query failed:", getattr(e, "message", str(e)))
+        return None
 
-def notion_upsert(db:str,url:str,title:str,shared_by:str,shared_on_iso:str)->Optional[str]:
-    pid=notion_find_by_url(db,url)
-    props={
-        "Article Name":{"title":[{"text":{"content":title[:2000]}}]},
-        "URL or Permalink":{"url":url},
-        "Shared by":{"rich_text":[{"text":{"content":shared_by}}]},
-        "Shared on":{"date":{"start":shared_on_iso}},
+def notion_upsert(db: str, url: str, title: str, shared_by: str, shared_on_iso: str) -> Optional[str]:
+    pid = notion_find_by_url(db, url)
+    props = {
+        "Article Name": {"title": [{"text": {"content": title[:2000]}}]},
+        "URL or Permalink": {"url": url},
+        "Shared by": {"rich_text": [{"text": {"content": shared_by}}]},
+        "Shared on": {"date": {"start": shared_on_iso}},
     }
     try:
         if pid:
-            return notion.pages.update(page_id=pid,properties=props)["id"]
+            return notion.pages.update(page_id=pid, properties=props)["id"]
         else:
-            return notion.pages.create(parent={"database_id":db},properties=props)["id"]
+            return notion.pages.create(parent={"database_id": db}, properties=props)["id"]
     except APIResponseError as e:
-        print("[Notion] Upsert failed:",getattr(e,"message",str(e))); return None
+        print("[Notion] Upsert failed:", getattr(e, "message", str(e)))
+        return None
 
-# ---------- main ----------
+# ------------- Main -------------
 def main():
     slack.auth_test()
-    count=0
+    processed = 0
+
     for m in list_all_messages(SLACK_CHANNEL_ID):
-        ts=m.get("ts",time.time())
-        iso=iso_from_ts(ts); human=chicago_time_from_ts(ts)
-        user=get_user_display(m.get("user") or m.get("bot_id") or "")
+        ts = m.get("ts", time.time())
+        iso = iso_from_ts(ts)
+        human = chicago_time_from_ts(ts)
+        user = get_user_display(m.get("user") or m.get("bot_id") or "")
 
         # 1) Canonicalized article links
         for u in extract_urls(m):
-            t=fetch_title(u) or u
-            notion_upsert(NOTION_DATABASE_ID,u,t,user,iso)
-            count+=1
-            print(f"[Upsert] LINK | {u} | {user} | {human}")
+            title = fetch_title(u) or u
+            notion_upsert(NOTION_DATABASE_ID, u, title, user, iso)
+            processed += 1
+            print(f"[Upsert] LINK | {u} | {user} | {human} | title={title}")
 
-        # 2) PDFs → use (canonicalized) message permalink
-        pdfs=pdf_message_links(m,SLACK_CHANNEL_ID)
+        # 2) PDFs → use (canonicalized) message permalink; try to resolve a nice title
+        pdfs = pdf_message_links(m, SLACK_CHANNEL_ID)
         if pdfs:
-            p=pdfs[0]
-            name=first_pdf_name(m) or "PDF shared in Slack"
-            notion_upsert(NOTION_DATABASE_ID,p,name,user,iso)
-            count+=1
-            print(f"[Upsert] PDF | {p} | {user} | {human} | title={name}")
+            p = pdfs[0]
+            # Prefer HTTP-derived title from the permalink; fall back to Slack filename
+            http_title = fetch_title(p)
+            slack_name = first_pdf_name(m)
+            title = http_title or slack_name or "PDF shared in Slack"
+            notion_upsert(NOTION_DATABASE_ID, p, title, user, iso)
+            processed += 1
+            print(f"[Upsert] PDF  | {p} | {user} | {human} | title={title}")
 
-    print(f"Processed {count} items.")
+    print(f"Processed {processed} items.")
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
