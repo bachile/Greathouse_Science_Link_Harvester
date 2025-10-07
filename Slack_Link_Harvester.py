@@ -1,11 +1,11 @@
-# Slack → Notion (scientific articles; aggressive real-title resolution incl. bioRxiv/Cell/OUP/PubMed)
-# Notion props: Article Name (Title), URL or Permalink (URL), Shared by (Rich text), Shared on (Date)
+# Slack → Notion (scientific articles; aggressive title/DOI resolution + cross-run dedupe)
+# Notion props (unchanged): Article Name (Title), URL or Permalink (URL), Shared by (Rich text), Shared on (Date)
 # Python 3.9 compatible
 
 import os, re, time, html, io, json, random
 from typing import Iterable, List, Dict, Any, Optional, Union, Tuple
 from datetime import datetime, timezone
-from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode, unquote, parse_qs
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode, unquote, parse_qs, quote
 
 try:
     from zoneinfo import ZoneInfo
@@ -14,6 +14,8 @@ except Exception:
     CENTRAL = timezone.utc
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 from pypdf import PdfReader
 from dotenv import load_dotenv
@@ -28,12 +30,34 @@ SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 SLACK_CHANNEL_ID = os.getenv("SLACK_CHANNEL_ID")
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
+FORCE_API_TITLES = os.getenv("FORCE_API_TITLES", "0") == "1"  # optional "no-scrape" fallback
+
 for k,v in {"SLACK_BOT_TOKEN":SLACK_BOT_TOKEN,"SLACK_CHANNEL_ID":SLACK_CHANNEL_ID,
             "NOTION_TOKEN":NOTION_TOKEN,"NOTION_DATABASE_ID":NOTION_DATABASE_ID}.items():
     if not v: raise RuntimeError(f"Missing {k} in env/.env")
 
 slack = WebClient(token=SLACK_BOT_TOKEN)
 notion = Notion(auth=NOTION_TOKEN)
+
+def make_session() -> requests.Session:
+    s = requests.Session()
+    retries = Retry(
+        total=5, connect=3, read=3, backoff_factor=0.6,
+        status_forcelist=[403, 408, 429, 500, 502, 503, 504],
+        allowed_methods=["HEAD", "GET", "OPTIONS"]
+    )
+    adapter = HTTPAdapter(max_retries=retries, pool_connections=50, pool_maxsize=50)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    s.headers.update({
+        "User-Agent":"Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+        "Accept":"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language":"en-US,en;q=0.8",
+        "Referer":"https://www.google.com/"
+    })
+    return s
+
+SESSION = make_session()
 
 URL_RE = re.compile(r"https?://[^\s<>]+")
 DOI_RE = re.compile(r"10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.I)
@@ -43,7 +67,7 @@ TRACKING_KEYS = {
     "utm_name","utm_cid","utm_reader","utm_viz_id","utm_pubreferrer",
     "utm_swu","ga_source","ga_medium","ga_campaign","ga_content",
     "fbclid","gclid","mc_cid","mc_eid","igshid","mkt_tok",
-    "uuid","via","src","si","s","login"
+    "uuid","via","src","si","s","login","returnurl","redirect","ref"
 }
 
 SCHOLAR_HOSTS = {
@@ -64,26 +88,19 @@ SKIP_HOSTS = {"x.com","twitter.com","www.twitter.com","youtube.com","www.youtube
               "reddit.com","www.reddit.com"}
 
 CROSSREF_HEADERS = {"User-Agent":"LinkHarvester/1.0 (mailto:you@example.com)"}
-REQ_HEADERS = {
-    "User-Agent":"Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-    "Accept":"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language":"en-US,en;q=0.8",
-    "Referer":"https://www.google.com/"
-}
 
-# Journal slug → proper names (expand as needed)
-OUP_JOURNAL_MAP = {
-    "femsre": "FEMS Microbiology Reviews",
-}
-OUP_JOURNAL_ABBREV = {
-    "femsre": "FEMS Microbiol Rev",
-}
+# Journal maps
+OUP_JOURNAL_MAP = {"femsre": "FEMS Microbiology Reviews"}
+OUP_JOURNAL_ABBREV = {"femsre": "FEMS Microbiol Rev"}
 CELL_JOURNAL_MAP = {
     "cell": "Cell",
     "cell-reports": "Cell Reports",
     "cell-metabolism": "Cell Metabolism",
     "cell-host-microbe": "Cell Host & Microbe",
     "cell-systems": "Cell Systems",
+    "cancer-cell": "Cancer Cell",
+    "cell-chemical-biology": "Cell Chemical Biology",
+    "immunity": "Immunity",
 }
 
 # ---------- Time ----------
@@ -165,9 +182,9 @@ def is_scholarly_url(url: str) -> bool:
 
 def quick_content_type(url: str) -> Optional[str]:
     try:
-        r = requests.head(url, timeout=6, allow_redirects=True, headers=REQ_HEADERS)
+        r = SESSION.head(url, timeout=10, allow_redirects=True)
         if r.status_code // 100 == 3:
-            r = requests.get(url, timeout=6, allow_redirects=True, stream=True, headers=REQ_HEADERS)
+            r = SESSION.get(url, timeout=10, allow_redirects=True, stream=True)
         return r.headers.get("Content-Type","").lower()
     except Exception:
         return None
@@ -230,13 +247,13 @@ def pdf_message_permalink(msg:Dict[str,Any],cid:str)->Optional[str]:
     link=message_permalink(cid,ts)
     return canonicalize_url(link) or link
 
-# ---------- Crossref helpers ----------
+# ---------- Crossref & APIs ----------
 def try_crossref_title(doi: str, retries:int=2)->Optional[str]:
     doi = doi.strip()
     for i in range(retries+1):
         try:
-            r = requests.get(f"https://api.crossref.org/works/{doi}",
-                             timeout=10, headers=CROSSREF_HEADERS)
+            r = SESSION.get(f"https://api.crossref.org/works/{doi}",
+                            timeout=10, headers=CROSSREF_HEADERS)
             if r.status_code==200:
                 msg=(r.json() or {}).get("message",{})
                 titles=msg.get("title")
@@ -248,46 +265,47 @@ def try_crossref_title(doi: str, retries:int=2)->Optional[str]:
             time.sleep(0.5*(i+1))
     return None
 
-def crossref_search_title(query: str, prefer_domain: Optional[str]=None) -> Optional[str]:
+def crossref_search_title(query: str, prefer_domain: Optional[str]=None) -> Tuple[Optional[str], Optional[str]]:
     try:
-        r = requests.get("https://api.crossref.org/works",
-                         params={"query.bibliographic": query, "rows": 7, "select": "title,URL,DOI"},
-                         timeout=12, headers=CROSSREF_HEADERS)
-        if r.status_code != 200: return None
+        r = SESSION.get("https://api.crossref.org/works",
+                        params={"query.bibliographic": query, "rows": 7, "select": "title,URL,DOI"},
+                        timeout=12, headers=CROSSREF_HEADERS)
+        if r.status_code != 200: return None, None
         items = (r.json() or {}).get("message",{}).get("items",[]) or []
-        best = None
+        best_title, best_doi = None, None
         for it in items:
             titles = it.get("title") or []
             title = " ".join(titles).strip() if titles else ""
             urls = [it.get("URL")] if it.get("URL") else []
+            doi = it.get("DOI")
             if prefer_domain and any((prefer_domain in (url or "")) for url in urls):
-                if title: return title[:300]
-            if not best and title:
-                best = title[:300]
-        return best
+                if title: return title[:300], doi
+            if not best_title and title:
+                best_title, best_doi = title[:300], doi
+        return best_title, best_doi
     except Exception:
-        return None
+        return None, None
 
-def crossref_struct_title(container_title: Optional[str], volume: Optional[str], issue: Optional[str], page: Optional[str]) -> Optional[str]:
+def crossref_struct_title(container_title: Optional[str], volume: Optional[str], issue: Optional[str], page: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
     params = {"rows": 5, "select": "title,URL,DOI"}
     if container_title: params["query.container-title"] = container_title
     if volume:          params["volume"] = volume
     if issue:           params["issue"] = issue
     if page:            params["page"] = page
     try:
-        r = requests.get("https://api.crossref.org/works", params=params, timeout=12, headers=CROSSREF_HEADERS)
-        if r.status_code != 200: return None
+        r = SESSION.get("https://api.crossref.org/works", params=params, timeout=12, headers=CROSSREF_HEADERS)
+        if r.status_code != 200: return None, None
         items = (r.json() or {}).get("message", {}).get("items", []) or []
         for it in items:
             titles = it.get("title") or []
             t = " ".join(titles).strip() if titles else ""
-            if t: return t[:300]
+            if t:
+                return t[:300], it.get("DOI")
     except Exception:
-        return None
-    return None
+        return None, None
+    return None, None
 
-def crossref_search_in_container(raw_query: str, container_title: str) -> Optional[str]:
-    """Search Crossref using freeform 'query' but constrain by container-title (great for PII or OUP)."""
+def crossref_search_in_container(raw_query: str, container_title: str) -> Tuple[Optional[str], Optional[str]]:
     try:
         params = {
             "query": raw_query,
@@ -295,23 +313,23 @@ def crossref_search_in_container(raw_query: str, container_title: str) -> Option
             "rows": 12,
             "select": "title,URL,DOI",
         }
-        r = requests.get("https://api.crossref.org/works", params=params, timeout=12, headers=CROSSREF_HEADERS)
+        r = SESSION.get("https://api.crossref.org/works", params=params, timeout=12, headers=CROSSREF_HEADERS)
         if r.status_code != 200:
-            return None
+            return None, None
         items = (r.json() or {}).get("message", {}).get("items", []) or []
         for it in items:
             titles = it.get("title") or []
             t = " ".join(titles).strip() if titles else ""
             if t:
-                return t[:300]
+                return t[:300], it.get("DOI")
     except Exception:
-        return None
-    return None
+        return None, None
+    return None, None
 
-# ---------- bioRxiv API ----------
 def biorxiv_title_from_api(doi: str) -> Optional[str]:
     try:
-        r = requests.get(f"https://api.biorxiv.org/details/biorxiv/{doi}", timeout=10, headers=REQ_HEADERS)
+        doi_enc = quote(doi, safe="")
+        r = SESSION.get(f"https://api.biorxiv.org/details/biorxiv/{doi_enc}", timeout=12)
         if r.status_code == 200:
             coll = (r.json() or {}).get("collection") or []
             if coll:
@@ -329,6 +347,11 @@ def clean_text_strip_html(s:str)->str:
     if "<" in s and ">" in s:
         s = BeautifulSoup(s,"html.parser").get_text(" ")
     return " ".join(s.split())
+
+def normalize_title_for_key(s: str) -> str:
+    s = clean_text_strip_html(s).lower()
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 def looks_numericish(s: str) -> bool:
     if not isinstance(s, str): return True
@@ -409,18 +432,17 @@ def find_title_in_jsonld(soup: BeautifulSoup) -> Optional[str]:
         if t: return t
     return None
 
-def fetch_and_parse(url: str, timeout:int=16) -> Tuple[BeautifulSoup, requests.Response]:
-    r = requests.get(url, timeout=timeout, allow_redirects=True, headers=REQ_HEADERS)
+def fetch_and_parse(url: str, timeout:int=20) -> Tuple[BeautifulSoup, requests.Response]:
+    r = SESSION.get(url, timeout=timeout, allow_redirects=True)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
     return soup, r
 
 # ---------- PubMed fallback ----------
 def pubmed_title_by_jvp(journal: str, volume: str, page: str) -> Optional[str]:
-    """Use NCBI eutils to resolve title via Journal + Volume + Page."""
     try:
         term = f'"{journal}"[Journal] {volume}[Volume] {page}[Page]'
-        es = requests.get(
+        es = SESSION.get(
             "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
             params={"db":"pubmed","term":term,"retmode":"json","retmax":"1"},
             timeout=10,
@@ -429,7 +451,7 @@ def pubmed_title_by_jvp(journal: str, volume: str, page: str) -> Optional[str]:
         ids = (es.json() or {}).get("esearchresult", {}).get("idlist", [])
         if not ids: return None
         pmid = ids[0]
-        esum = requests.get(
+        esum = SESSION.get(
             "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi",
             params={"db":"pubmed","id":pmid,"retmode":"json"},
             timeout=10,
@@ -444,56 +466,57 @@ def pubmed_title_by_jvp(journal: str, volume: str, page: str) -> Optional[str]:
         return None
 
 # ---------- Publisher-specific ----------
-def publisher_specific_title(url: str, soup: Optional[BeautifulSoup]) -> Optional[str]:
+def publisher_specific_title_and_doi(url: str, soup: Optional[BeautifulSoup]) -> Tuple[Optional[str], Optional[str]]:
     host = urlparse(url).netloc.lower()
 
-    # --- bioRxiv / medRxiv ---
+    # bioRxiv / medRxiv
     if "biorxiv.org" in host or "medrxiv.org" in host:
         if soup:
             el = soup.find("meta", attrs={"name":"citation_title"})
             if el and el.get("content"):
-                return clean_text_strip_html(el["content"])
+                return clean_text_strip_html(el["content"]), find_doi_in_soup(soup)
             d = find_doi_in_soup(soup)
             if d:
                 t = biorxiv_title_from_api(d) or try_crossref_title(d)
-                if t: return clean_text_strip_html(t)
+                if t: return clean_text_strip_html(t), d
         m = DOI_RE.search(url)
         if m:
-            t = biorxiv_title_from_api(m.group(0)) or try_crossref_title(m.group(0))
-            if t: return clean_text_strip_html(t)
+            d = m.group(0)
+            t = biorxiv_title_from_api(d) or try_crossref_title(d)
+            if t: return clean_text_strip_html(t), d
 
-    # --- Cell / Elsevier family (Cell, ScienceDirect PII) ---
+    # Cell / Elsevier family (Cell, ScienceDirect PII)
     if "cell.com" in host or "sciencedirect.com" in host or "elsevier.com" in host:
         if soup:
             t = safe_meta(soup, ["citation_title","dc.title","DC.title","prism.title"])
-            if t: return t
+            if t: return t, find_doi_in_soup(soup)
             jl = find_title_in_jsonld(soup)
-            if jl: return clean_text_strip_html(jl)
+            if jl: return clean_text_strip_html(jl), find_doi_in_soup(soup)
             d = find_doi_in_soup(soup)
             if d:
-                t = try_crossref_title(d)
-                if t: return clean_text_strip_html(t)
+                tt = try_crossref_title(d)
+                if tt: return clean_text_strip_html(tt), d
 
         parts = [seg for seg in urlparse(url).path.split("/") if seg]
         journal_slug = parts[0] if parts else ""
         container = CELL_JOURNAL_MAP.get(journal_slug, None)
-        leaf = parts[-1] if parts else ""  # raw PII like S2211-1247(25)00596-0
+        leaf = parts[-1] if parts else ""  # raw PII
         if container and leaf:
-            t = crossref_search_in_container(leaf, container)
-            if t: return clean_text_strip_html(t)
-
+            t, d = crossref_search_in_container(leaf, container)
+            if t: return clean_text_strip_html(t), d
         hint_raw = leaf or url
-        t = crossref_search_title(hint_raw, prefer_domain="cell.com") or crossref_search_title(hint_raw, prefer_domain="sciencedirect.com")
-        if t: return clean_text_strip_html(t)
+        t, d = crossref_search_title(hint_raw, prefer_domain="cell.com")
+        if not t:
+            t, d = crossref_search_title(hint_raw, prefer_domain="sciencedirect.com")
+        if t: return clean_text_strip_html(t), d
 
-    # --- Oxford Academic (OUP) ---
+    # Oxford Academic (OUP)
     if "academic.oup.com" in host:
         jname = None
         if soup:
             t = safe_meta(soup, ["citation_title","dc.title","DC.title","prism.title"])
-            if t: return t
+            if t: return t, find_doi_in_soup(soup)
             jname = safe_meta(soup, ["citation_journal_title"])
-
         parts = [seg for seg in urlparse(url).path.split("/") if seg]
         try:
             j_idx = parts.index("article")
@@ -501,45 +524,31 @@ def publisher_specific_title(url: str, soup: Optional[BeautifulSoup]) -> Optiona
             vol = parts[j_idx+1] if j_idx+1 < len(parts) else ""
             iss = parts[j_idx+2] if j_idx+2 < len(parts) else ""
             pg  = parts[j_idx+3] if j_idx+3 < len(parts) else ""
-
             container = jname or OUP_JOURNAL_MAP.get(journal_slug, journal_slug.replace("-", " "))
 
-            # 1) precise Crossref structured query
-            t = crossref_struct_title(container, vol, iss, pg)
-            if t: return clean_text_strip_html(t)
+            t, d = crossref_struct_title(container, vol, iss, pg)
+            if t: return clean_text_strip_html(t), d
 
-            # 2) container-constrained freeform
             leaf = parts[-1] if parts else ""
             if container and (vol or iss or pg):
                 qry = " ".join(x for x in [leaf, vol, iss, pg] if x)
-                t = crossref_search_in_container(qry or leaf, container)
-                if t: return clean_text_strip_html(t)
+                t, d = crossref_search_in_container(qry or leaf, container)
+                if t: return clean_text_strip_html(t), d
 
-            # 3) bibliographic Crossref as last Crossref attempt
             bib = " ".join(x for x in [container, vol, iss, pg] if x)
             if bib:
-                t = crossref_search_title(bib, prefer_domain="academic.oup.com")
-                if t: return clean_text_strip_html(t)
+                t, d = crossref_search_title(bib, prefer_domain="academic.oup.com")
+                if t: return clean_text_strip_html(t), d
 
-            # 4) PubMed fallback (full title or common abbrev)
-            t = pubmed_title_by_jvp(container, vol, pg)
-            if not t:
-                abbr = OUP_JOURNAL_ABBREV.get(journal_slug, "")
-                if abbr:
-                    t = pubmed_title_by_jvp(abbr, vol, pg)
-            if t: return clean_text_strip_html(t)
-
+            t2 = pubmed_title_by_jvp(container, vol, pg) or pubmed_title_by_jvp(OUP_JOURNAL_ABBREV.get(journal_slug,""), vol, pg)
+            if t2: return clean_text_strip_html(t2), None
         except ValueError:
             pass
 
-    return None
+    return None, None
 
-# ---------- PDF title helpers (UPDATED with sentence picker) ----------
+# ---------- PDF title helpers ----------
 def _pick_best_sentence(candidate: str) -> str:
-    """
-    Split a block into sentence-like pieces and pick the one that looks most like a title.
-    Prefers mid-length, high letter ratio, few commas, not boilerplate, not all-caps.
-    """
     parts = re.split(r"[\.!?]+", candidate)
     parts = [re.sub(r"\s+", " ", p).strip(" :;,-\u2013\u2014 ") for p in parts]
     parts = [p for p in parts if p]
@@ -578,19 +587,11 @@ def _pick_best_sentence(candidate: str) -> str:
     return best
 
 def extract_pdf_title_from_bytes(data: bytes) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Extract a human title from a PDF:
-      1) Use XMP Title if plausible
-      2) Find DOI anywhere in first 5 pages -> Crossref title
-      3) Heuristic from page-1 text: remove boilerplate, pick best 1–3 line block, then pick best sentence.
-    Returns: (title, doi_if_found)
-    """
     try:
         reader = PdfReader(io.BytesIO(data))
     except Exception:
         return None, None
 
-    # 1) XMP metadata title (good when present & not junk)
     try:
         md = getattr(reader, "metadata", None)
         if md and isinstance(md.title, str):
@@ -602,7 +603,6 @@ def extract_pdf_title_from_bytes(data: bytes) -> Tuple[Optional[str], Optional[s
     except Exception:
         pass
 
-    # Pull text from first up to 5 pages (for DOI & heuristics)
     texts = []
     try:
         maxp = min(5, len(reader.pages))
@@ -614,7 +614,6 @@ def extract_pdf_title_from_bytes(data: bytes) -> Tuple[Optional[str], Optional[s
 
     all_text = "\n".join(texts)
 
-    # 2) DOI → Crossref (best quality)
     m = DOI_RE.search(all_text or "")
     if m:
         doi = m.group(0)
@@ -622,7 +621,6 @@ def extract_pdf_title_from_bytes(data: bytes) -> Tuple[Optional[str], Optional[s
         if cr:
             return cr, doi
 
-    # 3) Heuristic from page 1
     page1 = (texts[0] if texts else "") or ""
     if not page1.strip():
         return None, None
@@ -706,36 +704,31 @@ def extract_pdf_title_from_bytes(data: bytes) -> Tuple[Optional[str], Optional[s
 
     return None, None
 
-def fetch_pdf_title_via_slack(file_obj: Dict[str,Any]) -> Optional[str]:
+def fetch_pdf_title_via_slack(file_obj: Dict[str,Any]) -> Tuple[Optional[str], Optional[str]]:
     url_priv = file_obj.get("url_private_download") or file_obj.get("url_private")
-    if not url_priv: return None
+    if not url_priv: return None, None
     try:
-        r = requests.get(url_priv, timeout=30,
-                         headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}",
-                                  **REQ_HEADERS})
+        r = SESSION.get(url_priv, timeout=30, headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"})
         r.raise_for_status()
-        t, _ = extract_pdf_title_from_bytes(r.content)
-        return t
+        return extract_pdf_title_from_bytes(r.content)
     except Exception:
-        return None
+        return None, None
 
-def fetch_pdf_title_direct(url: str) -> Optional[str]:
+def fetch_pdf_title_direct(url: str) -> Tuple[Optional[str], Optional[str]]:
     try:
-        r = requests.get(url, timeout=30, headers=REQ_HEADERS)
+        r = SESSION.get(url, timeout=30)
         r.raise_for_status()
-        t, _ = extract_pdf_title_from_bytes(r.content)
-        return t
+        return extract_pdf_title_from_bytes(r.content)
     except Exception:
-        return None
+        return None, None
 
-# ---------- Title resolution ----------
-def resolve_best_title_for_url(url: str) -> str:
+# ---------- Title+DOI resolution ----------
+def resolve_best_title_and_doi_for_url(url: str) -> Tuple[str, Optional[str]]:
     # Direct PDF?
     if is_direct_pdf_url(url):
-        t = fetch_pdf_title_direct(url)
-        if t: return clean_text_strip_html(t)
+        t, d = fetch_pdf_title_direct(url)
+        if t: return clean_text_strip_html(t), d
 
-    # DOI in URL? Crossref first; bioRxiv API if host matches
     m = DOI_RE.search(url)
     if m:
         doi = m.group(0)
@@ -743,94 +736,103 @@ def resolve_best_title_for_url(url: str) -> str:
             t = biorxiv_title_from_api(doi) or try_crossref_title(doi)
         else:
             t = try_crossref_title(doi)
-        if t: return clean_text_strip_html(t)
+        if t: return clean_text_strip_html(t), doi
 
-    # First pass
-    first_title, current_url = _resolve_title_single_pass(url)
+    if FORCE_API_TITLES:
+        host = urlparse(url).netloc.lower()
+        parts = [seg for seg in urlparse(url).path.split("/") if seg]
 
-    if looks_numericish(first_title):
-        # Second pass with forced retry
-        second_title, _ = _resolve_title_single_pass(current_url or url, force_retry=True)
-        return second_title or first_title
+        if "cell.com" in host or "sciencedirect.com" in host or "elsevier.com" in host:
+            container = CELL_JOURNAL_MAP.get(parts[0] if parts else "", None)
+            leaf = parts[-1] if parts else ""
+            if container and leaf:
+                t, d = crossref_search_in_container(leaf, container)
+                if t: return clean_text_strip_html(t), d
+            t, d = crossref_search_title(leaf or url, prefer_domain=host)
+            if t: return clean_text_strip_html(t), d
 
-    return first_title
+        if "academic.oup.com" in host:
+            try:
+                j_idx = parts.index("article")
+                journal_slug = parts[j_idx-1] if j_idx-1 >= 0 else ""
+                vol = parts[j_idx+1] if j_idx+1 < len(parts) else ""
+                iss = parts[j_idx+2] if j_idx+2 < len(parts) else ""
+                pg  = parts[j_idx+3] if j_idx+3 < len(parts) else ""
+                container = OUP_JOURNAL_MAP.get(journal_slug, journal_slug.replace("-", " "))
+                t, d = crossref_struct_title(container, vol, iss, pg)
+                if not t:
+                    t = pubmed_title_by_jvp(container, vol, pg) or pubmed_title_by_jvp(OUP_JOURNAL_ABBREV.get(journal_slug,""), vol, pg)
+                if t: return clean_text_strip_html(t), d
+            except ValueError:
+                pass
 
-def _resolve_title_single_pass(url: str, force_retry: bool=False) -> Tuple[str, str]:
+        # Fallback
+        tt = infer_from_url(url) or url
+        return clean_text_strip_html(tt), None
+
+    # HTML fetch (normal path)
     try:
         soup, resp = fetch_and_parse(url)
         current_url = resp.url
     except Exception:
-        return (clean_text_strip_html(infer_from_url(url) or url), url)
+        return clean_text_strip_html(infer_from_url(url) or url), None
 
     # Canonical hop (once)
-    canon = None
     link = soup.find("link", rel=lambda v: v and "canonical" in v.lower())
     if link and link.get("href"):
         href = link["href"].strip()
         if href and href != resp.url:
             canon = canonicalize_url(href)
-    if canon and (canon != url):
-        try:
-            soup, resp = fetch_and_parse(canon)
-            current_url = resp.url
-        except Exception:
-            pass
+            if canon and (canon != url):
+                try:
+                    soup, resp = fetch_and_parse(canon)
+                    current_url = resp.url
+                except Exception:
+                    current_url = resp.url
+    else:
+        current_url = resp.url
 
     # Publisher-specific first
-    t = publisher_specific_title(current_url, soup)
-    if t and (not looks_numericish(t) or not force_retry):
-        return (t, current_url)
+    t, d = publisher_specific_title_and_doi(current_url, soup)
+    if t: return t, d or find_doi_in_soup(soup)
 
     # Generic scholarly meta
     for css, attr in SCHOLAR_META_CANDIDATES:
         el = soup.select_one(css)
         if el and el.get(attr):
             tt = clean_text_strip_html(el.get(attr))
-            if tt:
-                if looks_numericish(tt) and not force_retry:
-                    return (tt, current_url)
-                return (tt, current_url)
+            if tt: return tt, find_doi_in_soup(soup)
 
     # JSON-LD headline
     jl = find_title_in_jsonld(soup)
     if jl:
         jj = clean_text_strip_html(jl)
-        if jj:
-            if looks_numericish(jj) and not force_retry:
-                return (jj, current_url)
-            return (jj, current_url)
+        if jj: return jj, find_doi_in_soup(soup)
 
     # <title> / <h1>
     if soup.title and soup.title.string:
         tt = clean_text_strip_html(soup.title.string)
-        if tt:
-            if looks_numericish(tt) and not force_retry:
-                return (tt, current_url)
-            return (tt, current_url)
+        if tt: return tt, find_doi_in_soup(soup)
     h1 = soup.find("h1")
     if h1:
         tt = clean_text_strip_html(h1.get_text(" "))
-        if tt:
-            if looks_numericish(tt) and not force_retry:
-                return (tt, current_url)
-            return (tt, current_url)
+        if tt: return tt, find_doi_in_soup(soup)
 
     # DOI on page → Crossref
     d = find_doi_in_soup(soup)
     if d:
         t2 = try_crossref_title(d)
         if t2:
-            return (clean_text_strip_html(t2), current_url)
+            return clean_text_strip_html(t2), d
 
     # Last resort: Crossref freeform by leaf / whole URL
     leaf = (urlparse(current_url).path.split("/") or [""])[-1]
     hint = leaf or current_url
-    t3 = crossref_search_title(hint, prefer_domain=urlparse(current_url).netloc.lower())
+    t3, d3 = crossref_search_title(hint, prefer_domain=urlparse(current_url).netloc.lower())
     if t3:
-        return (clean_text_strip_html(t3), current_url)
+        return clean_text_strip_html(t3), d3
 
-    # Fallback
-    return (clean_text_strip_html(infer_from_url(current_url) or current_url), current_url)
+    return clean_text_strip_html(infer_from_url(current_url) or current_url), None
 
 def infer_from_url(url: str) -> Optional[str]:
     try:
@@ -848,12 +850,17 @@ def infer_from_url(url: str) -> Optional[str]:
     except Exception:
         return None
 
-# ---------- Notion ----------
-def notion_find_by_url(db: str, url: str) -> Optional[str]:
+# ---------- Notion upsert with dedupe ----------
+def notion_find_existing(db: str, url: str, title: Optional[str], doi: Optional[str]) -> Optional[str]:
+    or_filters = [{"property":"URL or Permalink","url":{"equals":url}}]
+    if doi:
+        or_filters.append({"property":"URL or Permalink","url":{"contains":doi}})
+    if title and len(title) <= 200:
+        or_filters.append({"property":"Article Name","title":{"equals":title}})
     try:
         r = notion.databases.query(
             database_id=db,
-            filter={"property":"URL or Permalink","url":{"equals":url}},
+            filter={"or": or_filters},
             page_size=1
         )
         res=r.get("results",[])
@@ -861,7 +868,7 @@ def notion_find_by_url(db: str, url: str) -> Optional[str]:
     except APIResponseError as e:
         print("[Notion] Query failed:",getattr(e,"message",str(e))); return None
 
-def notion_upsert(db: str, url: str, title: str, shared_by: str, shared_on_iso: str) -> Optional[str]:
+def notion_upsert(db: str, url: str, title: str, shared_by: str, shared_on_iso: str, doi: Optional[str]) -> Optional[str]:
     props={
         "Article Name":{"title":[{"text":{"content":title[:2000]}}]},
         "URL or Permalink":{"url":url},
@@ -869,7 +876,7 @@ def notion_upsert(db: str, url: str, title: str, shared_by: str, shared_on_iso: 
         "Shared on":{"date":{"start":shared_on_iso}},
     }
     try:
-        pid=notion_find_by_url(db,url)
+        pid = notion_find_existing(db, url, title, doi)
         if pid: return notion.pages.update(page_id=pid,properties=props)["id"]
         else:   return notion.pages.create(parent={"database_id":db},properties=props)["id"]
     except APIResponseError as e:
@@ -879,45 +886,62 @@ def notion_upsert(db: str, url: str, title: str, shared_by: str, shared_on_iso: 
 def main():
     slack.auth_test()
     processed=0
+    seen_keys=set()  # in-run dedupe (doi or normalized title)
 
     for m in list_all_messages(SLACK_CHANNEL_ID):
         ts=m.get("ts",time.time())
         iso=iso_from_ts(ts); human=chicago_time_from_ts(ts)
         user=get_user_display(m.get("user") or m.get("bot_id") or "")
 
-        # 1) HTML article links (scientific only)
         urls = extract_urls(m)
+        pdfs = get_pdf_files(m)
+
+        # 1) HTML article links
         for u in urls:
-            title = resolve_best_title_for_url(u)
-            # Hard guarantee: avoid numeric-only fallback
+            title, doi = resolve_best_title_and_doi_for_url(u)
             if looks_numericish(title):
                 host = urlparse(u).netloc
                 title = f"Article on {host}"
-            notion_upsert(NOTION_DATABASE_ID,u,title,user,iso)
+
+            key = (doi or "") or normalize_title_for_key(title)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+
+            notion_upsert(NOTION_DATABASE_ID,u,title,user,iso,doi)
             processed+=1
             print(f"[Upsert] LINK | {u} | {user} | {human} | title={title}")
 
-        # 2) PDFs uploaded to Slack → permalink + PDF title (if we can read it)
-        pdfs = get_pdf_files(m)
+        # 2) PDFs uploaded → permalink
         if pdfs:
             permalink = pdf_message_permalink(m, SLACK_CHANNEL_ID)
             if permalink:
                 fn = (pdfs[0].get("name") or pdfs[0].get("title") or "").strip()
                 title = clean_text_strip_html(" ".join(fn.replace("_"," ").replace("-"," ").split())) or "PDF"
-                better = fetch_pdf_title_via_slack(pdfs[0])
-                if better: title = clean_text_strip_html(better)
+                better_title, doi = fetch_pdf_title_via_slack(pdfs[0])
+                if better_title: title = clean_text_strip_html(better_title)
                 if looks_numericish(title):
                     title = "PDF Article"
-                notion_upsert(NOTION_DATABASE_ID,permalink,title,user,iso)
-                processed+=1
-                print(f"[Upsert] PDF  | {permalink} | {user} | {human} | title={title}")
 
-        # 3) Direct PDF links shared
+                key = (doi or "") or normalize_title_for_key(title)
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    notion_upsert(NOTION_DATABASE_ID,permalink,title,user,iso,doi)
+                    processed+=1
+                    print(f"[Upsert] PDF  | {permalink} | {user} | {human} | title={title}")
+
+        # 3) Direct PDF links (in text)
         for u in urls:
             if is_direct_pdf_url(u):
-                better = fetch_pdf_title_direct(u)
-                title = clean_text_strip_html(better) if better else "PDF Article"
-                notion_upsert(NOTION_DATABASE_ID,u,title,user,iso)
+                title, doi = fetch_pdf_title_direct(u)
+                if not title: title = "PDF Article"
+
+                key = (doi or "") or normalize_title_for_key(title)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+
+                notion_upsert(NOTION_DATABASE_ID,u,clean_text_strip_html(title),user,iso,doi)
                 processed+=1
                 print(f"[Upsert] PDF(URL) | {u} | {user} | {human} | title={title}")
 
