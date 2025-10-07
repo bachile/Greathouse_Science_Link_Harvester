@@ -1,7 +1,8 @@
 # Python 3.9-compatible – Slack → Notion link harvester
 # - Canonicalizes URLs to avoid duplicates
-# - Fetches human-friendly titles (OG/Twitter meta, <title>, <h1>, PDF filenames, or URL inference)
-# - Stores into Notion with properties: Article Name (Title), URL or Permalink (URL), Shared by (Rich text), Shared on (Date)
+# - Fetches human-friendly titles for web pages (OG/Twitter meta, <title>, <h1>, or URL inference)
+# - For PDFs: uses Slack filename as the title
+# - Notion properties: Article Name (Title), URL or Permalink (URL), Shared by (Rich text), Shared on (Date)
 
 import os, re, time, html
 from typing import Iterable, List, Dict, Any, Optional, Union
@@ -41,8 +42,7 @@ for k, v in {
 slack = WebClient(token=SLACK_BOT_TOKEN)
 notion = Notion(auth=NOTION_TOKEN)
 
-# Strict-ish URL capture (stop at spaces/angle-brackets)
-URL_RE = re.compile(r"https?://[^\s<>]+")
+URL_RE = re.compile(r"https?://[^\s<>]+")  # capture URL tokens, stop at spaces/angle-brackets
 
 # Common tracking params to strip for canonicalization
 TRACKING_KEYS = {
@@ -142,7 +142,7 @@ def canonicalize_url(u: str) -> Optional[str]:
         path = path.rstrip("/")
 
     q_pairs = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)]
-    q_pairs = [(k, v) for (k, v) in q_pairs if k not in TRACKING_KEYS]
+    q_pairs = [(k, v) for k, v in q_pairs if k not in TRACKING_KEYS]
     if q_pairs:
         q_pairs.sort()
         query = urlencode(q_pairs, doseq=True)
@@ -223,7 +223,7 @@ def pdf_message_links(msg: Dict[str, Any], cid: str) -> List[str]:
     canon = canonicalize_url(link) or link
     return [canon]
 
-# ------------- Title resolution -------------
+# ------------- Title resolution for web pages -------------
 def _clean_title(txt: Optional[str]) -> Optional[str]:
     if not txt:
         return None
@@ -258,23 +258,12 @@ def _infer_title_from_url(url: str) -> Optional[str]:
         pass
     return None
 
-def _is_pdf_response(resp: requests.Response) -> bool:
-    ctype = resp.headers.get("Content-Type", "").lower()
-    return "application/pdf" in ctype or resp.url.lower().endswith(".pdf")
-
-def _filename_from_headers(resp: requests.Response) -> Optional[str]:
-    cd = resp.headers.get("Content-Disposition", "")
-    if "filename=" in cd:
-        fname = cd.split("filename=", 1)[1].strip().strip("\"'")
-        return _clean_title(fname)
-    return None
-
 def fetch_title(url: str, timeout: int = 8) -> Optional[str]:
     """
-    Resolve a human-friendly title:
+    Resolve a human-friendly title for HTML pages:
     1) OG/Twitter meta, <title>, <h1>
-    2) If PDF: Content-Disposition filename or last path segment
-    3) Otherwise, infer from URL (path/query) as a last resort
+    2) Fall back to URL inference
+    (Note: PDFs are handled separately via Slack filename.)
     """
     try:
         r = requests.get(
@@ -284,17 +273,6 @@ def fetch_title(url: str, timeout: int = 8) -> Optional[str]:
             allow_redirects=True,
         )
         r.raise_for_status()
-
-        if _is_pdf_response(r):
-            name = _filename_from_headers(r)
-            if not name:
-                p = urlparse(r.url)
-                segs = [s for s in p.path.split("/") if s]
-                if segs:
-                    name = _clean_title(unquote(segs[-1]))
-            if name and name.lower().endswith(".pdf"):
-                name = name[:-4]
-            return name or "PDF"
 
         soup = BeautifulSoup(r.text, "html.parser")
 
@@ -371,21 +349,18 @@ def main():
         human = chicago_time_from_ts(ts)
         user = get_user_display(m.get("user") or m.get("bot_id") or "")
 
-        # 1) Canonicalized article links
+        # 1) Canonicalized article links (HTML pages)
         for u in extract_urls(m):
             title = fetch_title(u) or u
             notion_upsert(NOTION_DATABASE_ID, u, title, user, iso)
             processed += 1
             print(f"[Upsert] LINK | {u} | {user} | {human} | title={title}")
 
-        # 2) PDFs → use (canonicalized) message permalink; try to resolve a nice title
+        # 2) PDFs → use (canonicalized) message permalink; title = Slack filename (reverted)
         pdfs = pdf_message_links(m, SLACK_CHANNEL_ID)
         if pdfs:
             p = pdfs[0]
-            # Prefer HTTP-derived title from the permalink; fall back to Slack filename
-            http_title = fetch_title(p)
-            slack_name = first_pdf_name(m)
-            title = http_title or slack_name or "PDF shared in Slack"
+            title = first_pdf_name(m) or "PDF shared in Slack"   # << reverted behavior
             notion_upsert(NOTION_DATABASE_ID, p, title, user, iso)
             processed += 1
             print(f"[Upsert] PDF  | {p} | {user} | {human} | title={title}")
