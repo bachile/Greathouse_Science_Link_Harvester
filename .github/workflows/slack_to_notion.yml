@@ -1,10 +1,10 @@
 name: Slack → Notion (links)
 
 on:
-  # Run every at 9 AM and 5 PM.
+  # Run every day at 9 AM and 5 PM.
   schedule:
     - cron: "0 14 * * *"
-    - cron: "0 22 * * *"
+    
   # Allow manual runs from the Actions tab
   workflow_dispatch: {}
 
